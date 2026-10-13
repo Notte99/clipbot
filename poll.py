@@ -85,22 +85,32 @@ def process(db, updates):
         for u in m.get("new_chat_members", []):
             if not u.get("is_bot"):
                 remember(db, chat_id, u)
+        text = m.get("text", "")
         user = m.get("from")
-        if not user or user.get("is_bot"):
+        anon = (not user) or bool(user.get("is_bot"))
+        if text.startswith("/"):                     # คำสั่งทำงานได้แม้เป็นแอดมินไม่ระบุตัวตน
+            cmd = text.split()[0].split("@")[0].lower()
+            known = cmd in ("/report", "/missing")
+            if known:
+                pending.add((chat_id, cmd))
+            print(f"msg: command known={known} anonymous={anon}")
+            continue
+        if anon:
+            print("msg: skipped (ผู้ส่งเป็นบอทหรือแอดมินไม่ระบุตัวตน)")
             continue
         day = datetime.fromtimestamp(m["date"], TZ).date().isoformat()  # นับตามวันที่ส่งจริง
-        text = m.get("text", "")
-        if text.startswith("/"):
-            cmd = text.split()[0].split("@")[0].lower()
-            if cmd in ("/report", "/missing"):
-                pending.add((chat_id, cmd))
-        elif ("video" in m or "video_note" in m
-              or m.get("document", {}).get("mime_type", "").startswith("video/")):
+        if ("video" in m or "video_note" in m
+                or m.get("document", {}).get("mime_type", "").startswith("video/")):
             bump(db, day, chat_id, user, "videos")
+            print("msg: video")
         elif "photo" in m:
             bump(db, day, chat_id, user, "photos")
+            print("msg: photo")
         elif text:
             bump(db, day, chat_id, user, "msgs")
+            print("msg: text")
+        else:
+            print("msg: other (sticker/อื่นๆ ไม่นับ)")
     return pending
 
 
