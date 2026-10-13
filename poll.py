@@ -75,7 +75,11 @@ def process(db, updates):
     pending = set()
     for up in updates:
         m = up.get("message")
-        if not m or m["chat"]["type"] not in ("group", "supergroup"):
+        if not m:
+            print("skip: update without message")
+            continue
+        if m["chat"]["type"] not in ("group", "supergroup"):
+            print(f"skip: chat type {m['chat']['type']} (ต้องพิมพ์ในกลุ่ม)")
             continue
         chat_id = m["chat"]["id"]
         for u in m.get("new_chat_members", []):
@@ -125,6 +129,7 @@ def send(chat_id, text):
     try:
         for i in range(0, len(text), 3800):
             call("sendMessage", chat_id=chat_id, text=text[i:i + 3800])
+        print("sent ok to", chat_id)
     except Exception as e:
         print("send failed", chat_id, e)
 
@@ -135,6 +140,7 @@ def run(db, now=None):
     while True:
         ups = call("getUpdates", offset=offset, limit=100, timeout=0,
                    allowed_updates=["message"])
+        print(f"fetched {len(ups)} updates (offset {offset})")
         if not ups:
             break
         pending |= process(db, ups)
@@ -144,6 +150,8 @@ def run(db, now=None):
 
     now = now or datetime.now(TZ)
     day = now.date().isoformat()
+    n_members = db.execute("SELECT COUNT(*) FROM members").fetchone()[0]
+    print(f"pending commands: {sorted(pending)}, known members: {n_members}")
     for chat_id, cmd in pending:
         send(chat_id, report_text(db, chat_id, day) if cmd == "/report"
              else missing_text(db, chat_id, day))
