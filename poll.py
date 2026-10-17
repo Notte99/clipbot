@@ -13,6 +13,7 @@ import os
 import re
 import sqlite3
 import unicodedata
+import urllib.error
 import urllib.parse
 import urllib.request
 from collections import Counter
@@ -22,6 +23,7 @@ from zoneinfo import ZoneInfo
 TZ = ZoneInfo("Asia/Bangkok")
 REPORT_HOUR = 23          # ส่งสรุปอัตโนมัติรอบแรกที่รันหลัง 23:00 เวลาไทย
 NIGHTLY_REPORT = True     # False = ไม่ส่งสรุปเข้ากลุ่มเอง
+DELETE_JOIN_LEAVE = True  # ลบข้อความแจ้ง "xxx เข้า/ออกจากกลุ่ม" (บอทต้องมีสิทธิ์ Delete messages)
 DB_PATH = "stats.db"
 MAX_HISTORY_DAYS = 60
 MAX_KICK_DAYS = 14
@@ -40,10 +42,17 @@ def call(method, **params):
          for k, v in params.items()}).encode()
     req = urllib.request.Request(
         f"https://api.telegram.org/bot{token}/{method}", data=data)
-    with urllib.request.urlopen(req, timeout=60) as r:
-        res = json.load(r)
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            res = json.load(r)
+    except urllib.error.HTTPError as e:
+        try:
+            desc = json.loads(e.read()).get("description", "")
+        except Exception:
+            desc = ""
+        raise RuntimeError(f"HTTP {e.code} {desc}".strip())
     if not res.get("ok"):
-        raise RuntimeError(res)
+        raise RuntimeError(res.get("description", "telegram error"))
     return res["result"]
 
 
@@ -131,7 +140,7 @@ def admin_ids(chat_id):
         return None
 
 
-def process(db, updates):
+def process(db, updates, deletes=None):
     """นับสถิติจากข้อความ คืนค่าคำสั่งที่ต้องตอบ (เรียงตามลำดับที่พิมพ์)"""
     pending = []
     for up in updates:
@@ -148,6 +157,8 @@ def process(db, updates):
         for u in m.get("new_chat_members", []):
             if not u.get("is_bot"):
                 remember(db, chat_id, u, day)
+        if deletes is not None and (m.get("new_chat_members") or m.get("left_chat_member")):
+            deletes.append((chat_id, m["message_id"]))   # ข้อความแจ้งเข้า/ออก เตรียมลบ
         left = m.get("left_chat_member")
         if left:  # คนออก/โดนแตะ ไม่ต้องค้างในรายชื่อ (สถิติเก่ายังเก็บไว้)
             db.execute("DELETE FROM members WHERE chat_id=? AND user_id=?",
@@ -518,18 +529,31 @@ def run(db, now=None):
 
     offset = int(meta_get(db, "offset", "0"))
     pending = []
+    deletes = []
     while True:
         ups = call("getUpdates", offset=offset, limit=100, timeout=0,
                    allowed_updates=["message"])
         print(f"fetched {len(ups)} updates (offset {offset})")
         if not ups:
             break
-        for item in process(db, ups):
+        for item in process(db, ups, deletes):
             if item not in pending:
                 pending.append(item)
         offset = ups[-1]["update_id"] + 1
         meta_set(db, "offset", offset)
         db.commit()
+
+    if DELETE_JOIN_LEAVE and deletes:
+        ok = fail = 0
+        err = ""
+        for chat_id, mid in deletes[:200]:
+            try:
+                call("deleteMessage", chat_id=chat_id, message_id=mid)
+                ok += 1
+            except Exception as e:
+                fail += 1
+                err = str(e)[:100]
+        print(f"deleted {ok} join/leave notices, failed {fail}" + (f" ({err})" if fail else ""))
 
     n_members = db.execute("SELECT COUNT(*) FROM members").fetchone()[0]
     print(f"pending commands: {[(cmd, auth) for _, cmd, _, auth in pending]}, known members: {n_members}")
