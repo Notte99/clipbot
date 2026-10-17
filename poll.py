@@ -1,32 +1,38 @@
-cd /mnt/user-data/outputs/clipbot-github && cat > poll.py << 'EOF'
 """ClipBot (โหมด GitHub Actions): ตื่นมาอ่านข้อความใหม่ นับสถิติ ตอบคำสั่ง แล้วจบ
 
-คำสั่ง (ใช้ได้เฉพาะแอดมิน คนอื่นพิมพ์แล้วบอทไม่ตอบ):
-  /top [จำนวน|all] [คลิป|รูป|ข้อความ]  อันดับคนลงเยอะสุดตั้งแต่เข้ามา
-  /daily [YYYY-MM-DD]                  รายวัน: ใครลงคลิปแล้ว ใครยังไม่ลง
-  /never [วันที่เข้ากลุ่มมาแล้วอย่างน้อย] รายชื่อคนที่ไม่เคยลงคลิปเลยตั้งแต่เข้ากลุ่ม
-  /kick <แปะรายชื่อจาก /never>         แตะคนที่ระบุออกจากกลุ่ม
-  /report, /missing, /history          สถิติรายวัน / ใครยังไม่ลง / ย้อนหลังหลายวัน
+คำสั่งในกลุ่ม (ใช้ได้เฉพาะแอดมิน คนอื่นพิมพ์แล้วบอทไม่ตอบ):
+  /top [จำนวนคน|all] [คลิป|วัน|รูป|ข้อความ]  ท็อปคนที่ลงมากสุดตั้งแต่เริ่มนับ (ค่าเริ่มต้น 10 คน เรียงตามคลิป)
+  /daily [YYYY-MM-DD]    วันนี้/วันที่ระบุ ใครลงคลิป ใครไม่ลง
+  /never [วัน]           คนที่ไม่เคยลงคลิปเลยตั้งแต่เข้ากลุ่ม (เข้ามาแล้วอย่างน้อย N วัน ค่าเริ่มต้น 1)
+  /kick                  แตะตามรายชื่อที่ส่งต่อท้าย (ชื่อละบรรทัด) ถ้าเกิน 10 คนให้ใส่ ยืนยัน บรรทัดแรก
+  /report [วันที่]       สถิติรายคนของวัน   /missing [วันที่]  คนที่ไม่ลงคลิปของวัน
+  /history [วัน]         ย้อนหลังกี่วันที่ลงคลิป   /kicklist [วัน]  ไม่ลงคลิปติดกัน N วัน
 """
 import json
 import os
 import re
 import sqlite3
+import unicodedata
 import urllib.parse
 import urllib.request
+from collections import Counter
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 TZ = ZoneInfo("Asia/Bangkok")
 REPORT_HOUR = 23          # ส่งสรุปอัตโนมัติรอบแรกที่รันหลัง 23:00 เวลาไทย
+NIGHTLY_REPORT = True     # False = ไม่ส่งสรุปเข้ากลุ่มเอง
 DB_PATH = "stats.db"
 MAX_HISTORY_DAYS = 60
-COMMANDS = ("/report", "/missing", "/daily", "/top", "/never", "/history", "/kick")
-KICK_CONFIRM_OVER = 10    # แตะเกินกี่คนต้องพิมพ์ ยืนยัน
+MAX_KICK_DAYS = 14
+KICK_CONFIRM_OVER = 10    # แตะเกินกี่คนต้องใส่ ยืนยัน
 GAP_HOURS = 20            # บอทหยุดทำงานเกินกี่ชั่วโมงถือว่าข้อมูลช่วงนั้นไม่น่าไว้ใจ
+COMMANDS = ("/report", "/missing", "/daily", "/top", "/never",
+            "/history", "/kicklist", "/kick")
+KICK_HOWTO = ("\n\nสั่งแตะ: คัดลอกชื่อ (ลบบรรทัดคนที่ไม่ต้องการแตะออกได้) "
+              "แล้วส่งเป็นข้อความเดียวแบบนี้\n/kick\n1. ชื่อ\n2. ชื่อ")
 
 
-# ---------------------------------------------------------------- Telegram / DB
 def call(method, **params):
     token = os.environ["BOT_TOKEN"]
     data = urllib.parse.urlencode(
@@ -78,6 +84,10 @@ def full_name(u):
     return " ".join(p for p in (u.get("first_name"), u.get("last_name")) if p) or str(u["id"])
 
 
+def norm_name(s):
+    return " ".join(unicodedata.normalize("NFC", s).split()).casefold()
+
+
 def remember(db, chat_id, u, day):
     db.execute("INSERT INTO members(chat_id,user_id,name,first_day) VALUES(?,?,?,?) "
                "ON CONFLICT(chat_id,user_id) DO UPDATE SET name=excluded.name",
@@ -93,7 +103,6 @@ def bump(db, day, chat_id, u, col):
                (full_name(u), day, chat_id, u["id"]))
 
 
-# ---------------------------------------------------------------- สิทธิ์แอดมิน
 _ADMIN_CACHE = {}
 
 
@@ -122,7 +131,6 @@ def admin_ids(chat_id):
         return None
 
 
-# ---------------------------------------------------------------- อ่านข้อความ
 def process(db, updates):
     """นับสถิติจากข้อความ คืนค่าคำสั่งที่ต้องตอบ (เรียงตามลำดับที่พิมพ์)"""
     pending = []
@@ -151,15 +159,13 @@ def process(db, updates):
         user = m.get("from")
         anon = (not user) or bool(user.get("is_bot"))
         if text.startswith("/"):                     # คำสั่งทำงานได้แม้เป็นแอดมินไม่ระบุตัวตน
-            head = text.split(None, 1)
-            cmd = head[0].split("@")[0].lower()
-            rest = head[1] if len(head) > 1 else ""
-            arg = rest if cmd == "/kick" else " ".join(rest.split())  # /kick เก็บขึ้นบรรทัดไว้
+            bits = text.split(None, 1)
+            cmd = bits[0].split("@")[0].lower()
+            arg = bits[1] if len(bits) > 1 else ""   # เก็บทั้งก้อน (รวมขึ้นบรรทัดใหม่)
             known = cmd in COMMANDS
             if known:
                 item = (chat_id, cmd, arg, is_admin(chat_id, user, m))
-                if item not in pending:
-                    pending.append(item)
+                pending.append(item)
             print(f"msg: command known={known} anonymous={anon}")
             continue
         if anon:
@@ -180,15 +186,13 @@ def process(db, updates):
     return pending
 
 
-# ---------------------------------------------------------------- รายงาน
-def parse_day(arg, today):
-    word = arg.split()[0] if arg.split() else ""
-    if not word:
-        return today, None
-    try:
-        return date.fromisoformat(word).isoformat(), None
-    except ValueError:
-        return today, "รูปแบบวันที่ไม่ถูกต้อง ใช้แบบนี้: /daily 2026-10-12"
+# ---------- รายงาน ----------
+
+def labeled(db, chat_id, cands):
+    """ชื่อซ้ำกันให้ต่อท้ายด้วย [id ...] เพื่อแยกคนตอนสั่งแตะ"""
+    cnt = Counter(norm_name(n) for (n,) in db.execute(
+        "SELECT name FROM members WHERE chat_id=?", (chat_id,)))
+    return [f"{n} [id {u}]" if cnt[norm_name(n)] > 1 else n for u, n in cands]
 
 
 def report_text(db, chat_id, day):
@@ -201,67 +205,81 @@ def report_text(db, chat_id, day):
         f"{n}: 💬{a} 🎬{v} 🖼{p}" for n, a, v, p in rows)
 
 
-def not_posted(db, chat_id, day):
-    """สมาชิกที่เข้ากลุ่มแล้วในวันนั้น แต่ยังไม่ลงคลิป"""
-    return db.execute(
-        "SELECT name FROM members WHERE chat_id=? AND (first_day IS NULL OR first_day<=?) "
-        "AND user_id NOT IN (SELECT user_id FROM stats WHERE day=? AND chat_id=? AND videos>0) "
-        "ORDER BY name", (chat_id, day, day, chat_id)).fetchall()
+def missing_rows(db, chat_id, day):
+    skip = admin_ids(chat_id) or set()   # แอดมินเป็นคนตรวจ ไม่นับว่าขาด
+    return [r for r in db.execute(
+        "SELECT user_id,name FROM members WHERE chat_id=? AND user_id NOT IN "
+        "(SELECT user_id FROM stats WHERE day=? AND chat_id=? AND videos>0) "
+        "ORDER BY name", (chat_id, day, chat_id)).fetchall() if r[0] not in skip]
 
 
 def missing_text(db, chat_id, day):
-    rows = not_posted(db, chat_id, day)
+    rows = missing_rows(db, chat_id, day)
     if not rows:
         return f"✅ วันที่ {day} ทุกคนลงคลิปครบแล้ว"
     return f"❌ ยังไม่ลงคลิปวันที่ {day} ({len(rows)} คน)\n" + "\n".join(
-        f"{i}. {r[0]}" for i, r in enumerate(rows, 1))
+        f"{i}. {n}" for i, n in enumerate(labeled(db, chat_id, rows), 1))
 
 
 def daily_text(db, chat_id, day):
-    """รายวัน: ใครลงคลิปแล้ว / ใครยังไม่ลง"""
     posted = db.execute(
-        "SELECT m.name, s.videos FROM stats s JOIN members m "
-        "ON m.chat_id=s.chat_id AND m.user_id=s.user_id "
-        "WHERE s.day=? AND s.chat_id=? AND s.videos>0 ORDER BY s.videos DESC, m.name",
-        (day, chat_id)).fetchall()
-    miss = not_posted(db, chat_id, day)
+        "SELECT name,videos FROM stats WHERE day=? AND chat_id=? AND videos>0 "
+        "ORDER BY videos DESC, name", (day, chat_id)).fetchall()
+    missing = missing_rows(db, chat_id, day)
+    if not posted and not missing:
+        return f"ยังไม่มีข้อมูลวันที่ {day}"
     out = [f"📅 วันที่ {day}", f"✅ ลงคลิปแล้ว ({len(posted)} คน)"]
-    out += [f"{i}. {n} (🎬{v})" for i, (n, v) in enumerate(posted, 1)] or ["- ยังไม่มี"]
-    out += ["", f"❌ ยังไม่ลง ({len(miss)} คน)"]
-    out += [f"{i}. {r[0]}" for i, r in enumerate(miss, 1)] or ["- ไม่มี ครบทุกคน 🎉"]
+    out += [f"{i}. {n} 🎬{v}" for i, (n, v) in enumerate(posted, 1)] or ["- ยังไม่มี"]
+    out += ["", f"❌ ยังไม่ลง ({len(missing)} คน)"]
+    out += [f"{i}. {n}" for i, n in enumerate(labeled(db, chat_id, missing), 1)] or ["- ไม่มี"]
     return "\n".join(out)
 
 
-def top_text(db, chat_id, arg):
-    words = arg.lower().split()
-    limit = 10
-    key, label = 1, "คลิป"
-    for w in words:
-        if w == "all":
+def top_text(db, chat_id, arg, today):
+    """อันดับคนที่ลงมากที่สุดตั้งแต่เริ่มนับ: /top [จำนวนคน|all] [คลิป|วัน|รูป|ข้อความ]"""
+    limit, mode = 10, "video"
+    for tok in arg.lower().split():
+        if tok.isdigit():
+            limit = max(1, int(tok))
+        elif tok in ("all", "ทั้งหมด"):
             limit = None
-        elif w.isdigit():
-            limit = max(1, int(w))
-        elif w in ("รูป", "photos", "photo"):
-            key, label = 2, "รูป"
-        elif w in ("ข้อความ", "msgs", "msg"):
-            key, label = 3, "ข้อความ"
+        elif tok in ("วัน", "day", "days", "บ่อย"):
+            mode = "day"
+        elif tok in ("photo", "รูป"):
+            mode = "photo"
+        elif tok in ("msg", "text", "ข้อความ"):
+            mode = "msg"
+        elif tok in ("video", "clip", "คลิป"):
+            mode = "video"
     rows = db.execute(
-        "SELECT m.name, COALESCE(SUM(s.videos),0), COALESCE(SUM(s.photos),0), "
-        "COALESCE(SUM(s.msgs),0) FROM members m LEFT JOIN stats s "
+        "SELECT m.name, COALESCE(SUM(s.msgs),0), COALESCE(SUM(s.videos),0), "
+        "COALESCE(SUM(s.photos),0), COUNT(CASE WHEN s.videos>0 THEN 1 END), m.first_day "
+        "FROM members m LEFT JOIN stats s "
         "ON s.chat_id=m.chat_id AND s.user_id=m.user_id "
-        "WHERE m.chat_id=? GROUP BY m.user_id", (chat_id,)).fetchall()
+        "WHERE m.chat_id=? GROUP BY m.user_id, m.name, m.first_day", (chat_id,)).fetchall()
     if not rows:
         return "ยังไม่มีสมาชิกในระบบ"
-    rows.sort(key=lambda r: (-r[key], -r[1], -r[2], -r[3], r[0]))
-    shown = rows if limit is None else rows[:limit]
-    medals = ["🥇", "🥈", "🥉"]
-    lines = [f"🏆 อันดับตั้งแต่เข้ามา (เรียงตาม{label}) แสดง {len(shown)}/{len(rows)} คน"]
-    for i, (n, v, p, t) in enumerate(shown):
-        mark = medals[i] if i < 3 else f"{i + 1}."
-        lines.append(f"{mark} {n} — 🎬{v} 🖼{p} 💬{t}")
-    if limit is not None and len(rows) > limit:
-        lines.append("\nดูทั้งหมด: /top all")
-    return "\n".join(lines)
+    order = {"video": lambda r: (-r[2], -r[4], -r[3], -r[1], r[0]),
+             "day": lambda r: (-r[4], -r[2], -r[3], -r[1], r[0]),
+             "photo": lambda r: (-r[3], -r[2], -r[1], r[0]),
+             "msg": lambda r: (-r[1], -r[2], -r[3], r[0])}[mode]
+    rows.sort(key=order)
+    shown = rows[:limit] if limit else rows
+    label = {"video": "ส่งคลิปมากสุด", "day": "ลงคลิปบ่อยสุด (นับจำนวนวัน)",
+             "photo": "ส่งรูปมากสุด", "msg": "ส่งข้อความมากสุด"}[mode]
+    medals = {1: "🥇", 2: "🥈", 3: "🥉"}
+    t = date.fromisoformat(today)
+    lines = []
+    for i, (n, a, v, p, d, first) in enumerate(shown, 1):
+        rank = medals.get(i, f"{i}.")
+        if mode == "day":
+            possible = max((t - date.fromisoformat(first)).days + 1, 1) if first else d
+            lines.append(f"{rank} {n}: 🗓{d}/{possible} วัน 🎬{v}")
+        else:
+            lines.append(f"{rank} {n}: 🎬{v} 🖼{p} 💬{a}")
+    head = f"🏆 ท็อป {len(shown)} คน {label} (ตั้งแต่เริ่มนับ"
+    head += f", จากทั้งหมด {len(rows)} คน)" if len(shown) < len(rows) else ")"
+    return head + "\n" + "\n".join(lines)
 
 
 def history_text(db, chat_id, today, n):
@@ -286,114 +304,143 @@ def history_text(db, chat_id, today, n):
             + "\n".join(f"{nm}: {p}/{d} วัน (🎬{c})" for _, nm, p, d, c in rows))
 
 
-# ---------------------------------------------------------------- ระบบแตะ
-def gap_days_all(db):
-    return sorted(k[0][4:] for k in db.execute(
-        "SELECT key FROM meta WHERE key LIKE 'gap:%'").fetchall())
+# ---------- รายชื่อที่จะแตะ ----------
+
+def gap_days(db, limit=5):
+    return [k[4:] for (k,) in db.execute(
+        "SELECT key FROM meta WHERE key LIKE 'gap:%' ORDER BY key DESC LIMIT ?", (limit,))]
 
 
-def total_videos(db, chat_id, uid):
-    return db.execute("SELECT COALESCE(SUM(videos),0) FROM stats WHERE chat_id=? AND user_id=?",
-                      (chat_id, uid)).fetchone()[0]
-
-
-def never_candidates(db, chat_id, today, min_days, skip=frozenset()):
-    """ไม่เคยลงคลิปเลยตั้งแต่เข้ากลุ่ม และเข้ามาแล้วอย่างน้อย min_days วัน"""
-    cutoff = date.fromisoformat(today) - timedelta(days=min_days)
-    out = []
-    for uid, name, first in db.execute(
-            "SELECT user_id,name,first_day FROM members WHERE chat_id=?", (chat_id,)).fetchall():
-        if uid in skip or not first or date.fromisoformat(first) > cutoff:
-            continue
-        if total_videos(db, chat_id, uid) == 0:
-            out.append((uid, name, first))
-    out.sort(key=lambda c: (c[2], c[1]))
-    return out
-
-
-def never_text(db, chat_id, today, min_days):
+def never_text(db, chat_id, today, arg):
+    """คนที่ไม่เคยส่งคลิปเลยตั้งแต่เข้ากลุ่ม (เข้ามาแล้วอย่างน้อย n วัน)"""
+    first_tok = (arg.split() or [""])[0]
+    n = int(first_tok) if first_tok.isdigit() else 1
     admins = admin_ids(chat_id)
-    cands = never_candidates(db, chat_id, today, min_days, admins or frozenset())
-    head = f"🚫 ไม่เคยลงคลิปเลยตั้งแต่เข้ากลุ่ม (เข้ามาแล้วอย่างน้อย {min_days} วัน)"
+    skip = admins or set()
+    t = date.fromisoformat(today)
+    rows = db.execute(
+        "SELECT m.user_id, m.name, m.first_day, COALESCE(SUM(s.videos),0) "
+        "FROM members m LEFT JOIN stats s ON s.chat_id=m.chat_id AND s.user_id=m.user_id "
+        "WHERE m.chat_id=? GROUP BY m.user_id, m.name, m.first_day", (chat_id,)).fetchall()
+    cands = sorted(((u, nm) for u, nm, first, vids in rows
+                    if vids == 0 and u not in skip and first
+                    and (t - date.fromisoformat(first)).days >= n), key=lambda c: c[1])
+    head = f"🚫 ไม่เคยส่งคลิปเลยตั้งแต่เข้ากลุ่ม (เข้ามาแล้วอย่างน้อย {n} วัน)"
     if not cands:
         out = head + "\nไม่มีใครเข้าเกณฑ์"
     else:
         out = (head + f" รวม {len(cands)} คน\n"
-               + "\n".join(f"{i}. {nm} · {uid}" for i, (uid, nm, _) in enumerate(cands, 1))
-               + "\n\nจะแตะ: พิมพ์ /kick แล้วแปะรายชื่อนี้ต่อท้าย (ลบบรรทัดที่ไม่อยากแตะออกก่อนได้)")
-    gaps = gap_days_all(db)
+               + "\n".join(f"{i}. {x}" for i, x in enumerate(labeled(db, chat_id, cands), 1))
+               + KICK_HOWTO)
+    gaps = gap_days(db)
     if gaps:
-        out += ("\n\n⚠ บอทเคยหยุดทำงานนานในวันที่ " + ", ".join(gaps[-5:])
-                + " คนที่เข้ามาก่อนวันนั้นอาจมีคลิปที่นับไม่ครบ ตรวจซ้ำก่อนแตะ")
+        out += ("\n\n⚠️ บอทเคยหยุดทำงานนานในวันที่ " + ", ".join(gaps)
+                + " บางคนอาจถูกนับพลาด ตรวจก่อนแตะ")
     if admins is None:
-        out += "\n\n⚠ ตรวจรายชื่อแอดมินไม่ได้ รายชื่อนี้อาจมีแอดมินปนอยู่"
+        out += "\n\n⚠️ ตรวจรายชื่อแอดมินไม่ได้ รายชื่อนี้อาจมีแอดมินปนอยู่"
     return out
 
 
-def resolve_targets(db, chat_id, text):
-    """อ่านรายชื่อที่แปะมา: ถ้ามี ID ใช้ ID เป็นหลัก ไม่งั้นจับคู่ตามชื่อ"""
-    members = db.execute("SELECT user_id,name,first_day FROM members WHERE chat_id=?",
-                         (chat_id,)).fetchall()
-    by_id = {u: (n, f) for u, n, f in members}
-    by_name = {}
-    for u, n, _ in members:
-        by_name.setdefault(n.strip().lower(), []).append(u)
-    found, ambiguous, unknown = {}, [], []
-    ids = [int(x) for x in re.findall(r"(?<!\d)\d{6,15}(?!\d)", text)]
-    if ids:
-        for i in ids:
-            if i in by_id:
-                found[i] = by_id[i][0]
-            else:
-                unknown.append(str(i))
+def kicklist_text(db, chat_id, today, n):
+    """ไม่ลงคลิปติดกัน n วันที่จบแล้ว (ไม่นับวันนี้) และเข้ากลุ่มก่อนช่วงนั้น"""
+    admins = admin_ids(chat_id)
+    skip = admins or set()
+    end = date.fromisoformat(today) - timedelta(days=1)
+    start = end - timedelta(days=n - 1)
+    d0, d1 = start.isoformat(), end.isoformat()
+    cands = []
+    for uid, name, first in db.execute(
+            "SELECT user_id,name,first_day FROM members WHERE chat_id=?", (chat_id,)).fetchall():
+        if uid in skip or not first or date.fromisoformat(first) >= start:
+            continue  # แอดมิน หรือเพิ่งเข้ากลุ่ม ยังไม่ครบช่วง ผ่อนผัน
+        posted = db.execute(
+            "SELECT COUNT(*) FROM stats WHERE chat_id=? AND user_id=? "
+            "AND day>=? AND day<=? AND videos>0", (chat_id, uid, d0, d1)).fetchone()[0]
+        if posted == 0:
+            cands.append((uid, name))
+    cands.sort(key=lambda c: c[1])
+    head = f"👢 ไม่ลงคลิป {n} วันติด ({d0} ถึง {d1} ไม่นับวันนี้)"
+    if not cands:
+        out = head + "\nไม่มีใครเข้าเกณฑ์"
     else:
-        for line in text.splitlines():
-            clean = re.sub(r"^\s*(\d+[.)]|[-•*])\s*", "", line).strip()
-            if not clean:
-                continue
-            cand = by_name.get(clean.lower(), [])
-            if len(cand) == 1:
-                found[cand[0]] = by_id[cand[0]][0]
-            elif len(cand) > 1:
-                ambiguous.append(clean)
-            else:
-                unknown.append(clean)
-    return found, ambiguous, unknown, by_id
+        out = (head + f" รวม {len(cands)} คน\n"
+               + "\n".join(f"{i}. {x}" for i, x in enumerate(labeled(db, chat_id, cands), 1))
+               + KICK_HOWTO)
+    gaps = [g for g in gap_days(db, 60) if d0 <= g <= d1]
+    if gaps:
+        out += "\n\n⚠️ บอทเคยหยุดทำงานนานในวันที่ " + ", ".join(gaps) + " ข้อมูลอาจไม่ครบ ตรวจก่อนแตะ"
+    return out
 
 
-def do_kick(db, chat_id, arg, today, authorized):
-    if not authorized:
-        return "คำสั่งนี้ใช้ได้เฉพาะแอดมินของกลุ่ม"
-    confirm = "ยืนยัน" in arg
-    arg = arg.replace("ยืนยัน", "")
-    found, ambiguous, unknown, by_id = resolve_targets(db, chat_id, arg)
-    if not (found or ambiguous or unknown):
-        return "ต้องแปะรายชื่อต่อท้าย /kick (คัดลอกจากผลของ /never)"
+def parse_kick(arg):
+    lines = arg.split("\n")
+    confirm = False
+    if lines and lines[0].strip() == "ยืนยัน":
+        confirm, lines = True, lines[1:]
+    reqs = []
+    for ln in lines:
+        ln = re.sub(r"^\s*(?:\d+\s*[\.\)]|[-•*])\s*", "", ln).strip()
+        if not ln:
+            continue
+        mid = re.search(r"\s*\[id\s*(\d+)\]\s*$", ln)
+        if mid:
+            reqs.append(("id", int(mid.group(1)), ln[:mid.start()].strip()))
+        else:
+            reqs.append(("name", norm_name(ln), ln))
+    return confirm, reqs
+
+
+def do_kick(db, chat_id, arg, today):
+    confirm, reqs = parse_kick(arg)
+    if not reqs:
+        return "ยังไม่มีรายชื่อ ส่งแบบนี้:\n/kick\n1. ชื่อ\n2. ชื่อ\n(คัดลอกจากรายชื่อของ /never หรือ /kicklist)"
     admins = admin_ids(chat_id)
     if admins is None:
         return "ตรวจรายชื่อแอดมินของกลุ่มไม่ได้ ยังไม่แตะ ลองใหม่อีกครั้ง"
-    gaps = gap_days_all(db)
+    members = db.execute("SELECT user_id,name FROM members WHERE chat_id=?", (chat_id,)).fetchall()
+    by_id = dict(members)
+    by_name = {}
+    for uid, nm in members:
+        by_name.setdefault(norm_name(nm), []).append(uid)
 
-    targets, skipped = [], []
-    for uid, name in found.items():
+    targets, notfound, ambiguous, admin_skip, seen = [], [], [], [], set()
+    for kind, val, raw in reqs:
+        if kind == "id":
+            if val not in by_id:
+                notfound.append(raw or str(val))
+                continue
+            uid = val
+        else:
+            ids = by_name.get(val, [])
+            if not ids:
+                notfound.append(raw)
+                continue
+            if len(ids) > 1:
+                ambiguous.append(raw + " → " + " หรือ ".join(
+                    f"{by_id[i]} [id {i}]" for i in ids))
+                continue
+            uid = ids[0]
+        if uid in seen:
+            continue
+        seen.add(uid)
         if uid in admins:
-            skipped.append((name, "เป็นแอดมิน/เจ้าของกลุ่ม"))
+            admin_skip.append(by_id[uid])
             continue
-        reasons = []
-        vids = total_videos(db, chat_id, uid)
-        if vids > 0:
-            reasons.append(f"เคยลงคลิปแล้ว {vids} คลิป")
-        first = by_id[uid][1]
-        if first and any(g >= first for g in gaps):
-            reasons.append("ข้อมูลช่วงที่บอทหยุดทำงานอาจไม่ครบ")
-        if reasons and not confirm:
-            skipped.append((name, ", ".join(reasons)))
-            continue
-        targets.append((uid, name))
+        targets.append((uid, by_id[uid]))
 
+    notes = ""
+    if notfound:
+        notes += "\n\n❓ ไม่พบชื่อนี้ในกลุ่ม (สะกดต้องตรงกับที่บอทแสดง):\n" + "\n".join(f"- {x}" for x in notfound)
+    if ambiguous:
+        notes += "\n\n❓ ชื่อซ้ำกัน ยังไม่แตะ ให้ส่งใหม่พร้อม [id ...]:\n" + "\n".join(f"- {x}" for x in ambiguous)
+    if admin_skip:
+        notes += "\n\n🛡 เป็นแอดมิน แตะไม่ได้:\n" + "\n".join(f"- {x}" for x in admin_skip)
+    if not targets:
+        return "ไม่มีใครถูกแตะ" + notes
     if len(targets) > KICK_CONFIRM_OVER and not confirm:
-        return (f"จะแตะ {len(targets)} คน ซึ่งเยอะผิดปกติ ตรวจรายชื่อด้วย /never ก่อน\n"
-                "ถ้าถูกต้องแล้ว ส่งคำสั่งเดิมอีกครั้งโดยเติมคำว่า ยืนยัน")
+        return (f"จะแตะ {len(targets)} คน ซึ่งเยอะ ยังไม่ได้แตะ\n"
+                "ถ้าถูกต้อง ส่งรายชื่อเดิมอีกครั้ง โดยใส่คำว่า ยืนยัน ไว้บรรทัดแรกหลัง /kick\n"
+                "/kick\nยืนยัน\n1. ชื่อ ..." + notes)
 
     ok, failed, stuck = [], [], []
     for uid, name in targets:
@@ -412,65 +459,44 @@ def do_kick(db, chat_id, arg, today, authorized):
         db.execute("INSERT INTO kicks VALUES(?,?,?,?)", (today, chat_id, uid, name))
         db.execute("DELETE FROM members WHERE chat_id=? AND user_id=?", (chat_id, uid))
     db.commit()
-
-    out = [f"👢 แตะแล้ว {len(ok)} คน"] + [f"- {x}" for x in ok]
-    if skipped:
-        out += ["", "⏭ ข้าม (ยังไม่แตะ):"] + [f"- {n} ({why})" for n, why in skipped]
-        if any(n for n, why in skipped if "แอดมิน" not in why):
-            out.append("ถ้าตรวจแล้วอยากแตะจริง เติมคำว่า ยืนยัน ต่อท้ายคำสั่ง")
-    if ambiguous:
-        out += ["", "❓ ชื่อซ้ำหลายคน แยกไม่ได้ (ใช้รายการที่มีเลข ID):"] + [f"- {x}" for x in ambiguous]
-    if unknown:
-        out += ["", "❓ ไม่พบในรายชื่อสมาชิกที่บอทรู้จัก:"] + [f"- {x}" for x in unknown]
+    out = f"👢 แตะแล้ว {len(ok)} คน\n" + "\n".join(f"- {x}" for x in ok) if ok else "ไม่มีใครถูกแตะ"
     if failed:
-        out += ["", "❗ แตะไม่สำเร็จ (บอทอาจไม่มีสิทธิ์ Ban users):"] + [f"- {x}" for x in failed]
+        out += "\n\n❗ แตะไม่สำเร็จ (บอทอาจไม่มีสิทธิ์ Ban users):\n" + "\n".join(f"- {x}" for x in failed)
     if stuck:
-        out += ["", "❗ ปลดแบนไม่สำเร็จ (กลับเข้ากลุ่มไม่ได้จนกว่าจะปลดเอง):"] + [f"- {x}" for x in stuck]
-    return "\n".join(out)
+        out += "\n\n❗ ปลดแบนไม่สำเร็จ (เข้ากลุ่มใหม่ไม่ได้จนกว่าจะปลดเอง):\n" + "\n".join(f"- {x}" for x in stuck)
+    return out + notes
 
 
-# ---------------------------------------------------------------- ส่งข้อความ / ตอบคำสั่ง
-def chunks(text, limit=3800):
-    cur = ""
-    for line in text.split("\n"):
-        while len(line) > limit:
-            if cur:
-                yield cur
-                cur = ""
-            yield line[:limit]
-            line = line[limit:]
-        if cur and len(cur) + len(line) + 1 > limit:
-            yield cur
-            cur = line
-        else:
-            cur = line if not cur else cur + "\n" + line
-    if cur:
-        yield cur
-
+# ---------- ตอบคำสั่ง ----------
 
 def send(chat_id, text):
     try:
-        for part in chunks(text):
-            call("sendMessage", chat_id=chat_id, text=part)
+        for i in range(0, len(text), 3800):
+            call("sendMessage", chat_id=chat_id, text=text[i:i + 3800])
         print("sent ok to", chat_id)
     except Exception as e:
         print("send failed", chat_id, e)
 
 
-def answer(db, chat_id, cmd, arg, today, authorized=False):
-    first = arg.split()[0] if arg.split() else ""
+def answer(db, chat_id, cmd, arg, today):
+    first = (arg.split() or [""])[0]
+    num = int(first) if first.isdigit() else None
     if cmd == "/kick":
-        return do_kick(db, chat_id, arg, today, authorized)
-    if cmd == "/never":
-        return never_text(db, chat_id, today, int(first) if first.isdigit() else 1)
+        return do_kick(db, chat_id, arg, today)
     if cmd == "/top":
-        return top_text(db, chat_id, arg)
+        return top_text(db, chat_id, arg, today)
+    if cmd == "/never":
+        return never_text(db, chat_id, today, arg)
     if cmd == "/history":
-        n = int(first) if first.isdigit() else 7
-        return history_text(db, chat_id, today, max(1, min(n, MAX_HISTORY_DAYS)))
-    day, err = parse_day(arg, today)
-    if err:
-        return err
+        return history_text(db, chat_id, today, max(1, min(num or 7, MAX_HISTORY_DAYS)))
+    if cmd == "/kicklist":
+        return kicklist_text(db, chat_id, today, max(1, min(num or 1, MAX_KICK_DAYS)))
+    day = today
+    if first:
+        try:
+            day = date.fromisoformat(first).isoformat()
+        except ValueError:
+            return "รูปแบบวันที่ไม่ถูกต้อง ใช้แบบนี้: /daily 2026-10-12"
     if cmd == "/daily":
         return daily_text(db, chat_id, day)
     return report_text(db, chat_id, day) if cmd == "/report" else missing_text(db, chat_id, day)
@@ -481,7 +507,7 @@ def run(db, now=None):
     day = now.date().isoformat()
     _ADMIN_CACHE.clear()
 
-    # บันทึกช่วงที่บอทหยุดทำงานนาน (ใช้กันแตะคนจากข้อมูลไม่ครบ)
+    # บันทึกช่วงที่บอทหยุดทำงานนาน (ใช้เตือนว่าข้อมูลอาจไม่ครบ)
     last = meta_get(db, "last_run")
     if last and now.timestamp() - float(last) > GAP_HOURS * 3600:
         d = datetime.fromtimestamp(float(last), TZ).date()
@@ -506,14 +532,14 @@ def run(db, now=None):
         db.commit()
 
     n_members = db.execute("SELECT COUNT(*) FROM members").fetchone()[0]
-    print(f"pending commands: {[(c, cmd) for c, cmd, _, _ in pending]}, known members: {n_members}")
+    print(f"pending commands: {[(cmd, auth) for _, cmd, _, auth in pending]}, known members: {n_members}")
     for chat_id, cmd, arg, authorized in pending:
         if not authorized:
             print("ignored: command from non-admin")   # ไม่ตอบ เพื่อไม่ให้กลุ่มรก
             continue
-        send(chat_id, answer(db, chat_id, cmd, arg, day, authorized))
+        send(chat_id, answer(db, chat_id, cmd, arg, day))
 
-    if now.hour >= REPORT_HOUR:
+    if NIGHTLY_REPORT and now.hour >= REPORT_HOUR:
         for (chat_id,) in db.execute("SELECT DISTINCT chat_id FROM members").fetchall():
             if meta_get(db, f"report:{chat_id}") != day:
                 send(chat_id, daily_text(db, chat_id, day))
@@ -524,5 +550,3 @@ def run(db, now=None):
 
 if __name__ == "__main__":
     run(init_db(DB_PATH))
-EOF
-python3 -c "import ast;ast.parse(open('poll.py').read());print('syntax ok')"
